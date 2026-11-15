@@ -88,6 +88,8 @@ static ds4_tp *g_tp_block_ctx;
 #define DS4_CUDA_TP_PEER_TMP_BYTES \
     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float) + 128u)
 
+enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
+
 static uint32_t metal_graph_cuda_tp_output_requested_ways(void) {
     const char *env = getenv("DS4_CUDA_TP_OUTPUT_WAYS");
     if (!env || !env[0]) return 8;
@@ -2580,7 +2582,9 @@ static const char *tensor_type_name(uint32_t type) {
 static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     const gguf_type_info *info = tensor_type(type);
     if (!info || info->block_elems == 0) return false;
-    uint64_t blocks = (elements + info->block_elems - 1) / info->block_elems;
+    /* Do not overflow while rounding an untrusted GGUF element count up. */
+    uint64_t blocks = elements / info->block_elems +
+        (elements % info->block_elems != 0);
     if (blocks > UINT64_MAX / info->block_bytes) return false;
     *bytes = blocks * info->block_bytes;
     return true;
@@ -17258,7 +17262,6 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * tensor names follow the model stages rather than generic graph nodes.
  */
 
-enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
 
 typedef struct {
     /* Class P — per-tier replicated kernel scratch buffers.
@@ -62492,6 +62495,14 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
             bytes += (size_t)layer_comp_cap * DS4_N_INDEXER_HEAD_DIM *
                      sizeof(float);
         }
+        /* KV and score frontiers persist beside the compressed caches.
+         * Quad compression doubles both their width and their row count. */
+        const uint64_t coff = ratio == 4 ? 2u : 1u;
+        bytes += 2ull * coff * coff * ratio * DS4_N_HEAD_DIM * sizeof(float);
+        if (ratio == 4) {
+            bytes += 2ull * coff * coff * ratio *
+                     DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        }
     }
 
     /* Per-tier scratch (indexer_scores_by_tier, comp_mask_by_tier,
@@ -62499,8 +62510,8 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
      * extras) is accounted for separately by
      * engine_per_tier_graph_overhead_bytes() and pre-subtracted from
      * each device's vram_bytes in engine_classify_multi_tier. This
-     * helper returns per-layer KV/index cache ONLY. Charging scratch
-     * both here (per layer) and there (per tier) would double-count —
+     * helper returns per-layer KV/index caches and live frontiers. Charging
+     * scratch both here (per layer) and there (per tier) would double-count —
      * at large ctx the duplicate can falsely refuse layouts that
      * actually fit. */
     return bytes;
@@ -62705,6 +62716,7 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     total += (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);     /* routed_down */
     total += (uint64_t)DS4_N_EMBD * sizeof(float);                         /* routed_out */
     total += DS4_CUDA_TP_PEER_TMP_BYTES;                                   /* tp_peer_tmp_by_tier */
+    total += (uint64_t)DS4_N_EMBD * sizeof(float);                         /* ffn_out_by_tier, lazy */
     total += hc_dim * sizeof(float);                                       /* after_ffn_hc */
 
     /* === Class P chunked-prefill batch scratch (mirrors allocation above).
@@ -62753,6 +62765,14 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     /* === Class E embedding-tier prefill_tokens (mirrors ds4.c:10844).
      * Charged to ALL tiers conservatively. Negligible (pc * int32). === */
     total += pc * sizeof(int32_t);                         /* prefill_tokens_by_tier */
+    /* These shared prefill buffers live on the legacy allocation tier.
+     * Reserve them on every tier, as for the embedding/head-only extras. */
+    if (DS4_PLANNER_ATTN_COMP_CACHE_F16) {
+        total += pc * q_dim * sizeof(uint16_t);             /* batch_q_half */
+    }
+    total += (uint64_t)DS4_N_LAYER *
+             DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS *
+             DS4_N_EXPERT_USED * sizeof(int32_t);          /* prefill_seed_router_selected */
 
     /* === Head-tier-only extras (mirrors ds4.c:10806-10816). Charged
      * conservatively to EVERY tier. === */
@@ -72151,12 +72171,15 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
             continue;
         }
         uint64_t expert_bytes = 0;
+        uint64_t resident_bytes = t->bytes;
         if (cuda_tp_ep &&
             engine_deepseek_routed_expert_tensor(e, t, entry, &expert_bytes)) {
-            out[entry] += expert_bytes * (DS4_N_EXPERT / 2u);
-        } else {
-            out[entry] += t->bytes;
+            resident_bytes = expert_bytes * (DS4_N_EXPERT / 2u);
         }
+        /* SIZE_MAX marks an entry too large for any post-reserve GPU
+         * budget; wrapping the sum could instead make it appear to fit. */
+        out[entry] = resident_bytes > SIZE_MAX - out[entry] ?
+            SIZE_MAX : out[entry] + (size_t)resident_bytes;
     }
 
     if (ds4_model_is_qwen4()) {
@@ -72201,7 +72224,10 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
         /* Fallback: 128 MiB per layer as a static estimate. */
         const size_t fallback_per_layer = engine_size_mul_sat(
                 (size_t)128ull * 1024ull * 1024ull, session_count);
-        for (uint32_t i = 1; i <= DS4_N_LAYER; i++) out[i] += fallback_per_layer;
+        for (uint32_t i = 1; i <= DS4_N_LAYER; i++) {
+            out[i] = out[i] > SIZE_MAX - fallback_per_layer ?
+                SIZE_MAX : out[i] + fallback_per_layer;
+        }
     }
     return 0;
 }
@@ -72455,9 +72481,11 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
      * That outcome is never useful, so reject it loudly. Auto-detection
      * belongs in the CLI layer (CLI flag wiring maps --gpu-vram auto to
      * cudaMemGetInfo before constructing the config). */
-    size_t total_budget = 0;
-    for (int d = 0; d < cfg->n_gpus; d++) total_budget += cfg->vram_bytes[d];
-    if (total_budget == 0) {
+    bool has_budget = false;
+    for (int d = 0; d < cfg->n_gpus; d++) {
+        has_budget |= cfg->vram_bytes[d] != 0;
+    }
+    if (!has_budget) {
         fprintf(stderr,
                 "ds4: ds4_gpu_config has n_gpus=%d but every vram_bytes[d]==0; "
                 "caller must populate explicit budgets (auto-detect is the CLI's "
@@ -72502,8 +72530,12 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
          * cfg) so the per-tier overhead pre-subtract actually flows into
          * the packer. */
         size_t budget = e->gpu_cfg.vram_bytes[d];
-        size_t reserve = e->gpu_cfg.safety_margin_bytes + cublas_workspace_overhead;
-        pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
+        const size_t margin = e->gpu_cfg.safety_margin_bytes;
+        /* Subtract reserves separately so an oversized margin cannot
+         * wrap their sum and manufacture available memory. */
+        budget = budget > margin ? budget - margin : 0;
+        pcfg.gpu_budget_bytes[d] = budget > cublas_workspace_overhead ?
+            budget - cublas_workspace_overhead : 0;
     }
 
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
