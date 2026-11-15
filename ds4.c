@@ -13042,6 +13042,7 @@ static void topk_desc(const float *score, int n, int k, int *idx) {
     }
 }
 
+/* Seed each round from an eligible row, so the mask gains a distinct entry. */
 static void topk_allow_scores(bool *allowed, const float *scores,
                               uint32_t n, uint32_t k) {
     for (uint32_t rank = 0; rank < k; rank++) {
@@ -17257,7 +17258,6 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  * decode and another for batched prefill.  The structure is DS4-specific:
  * tensor names follow the model stages rather than generic graph nodes.
  */
-
 
 typedef struct {
     /* Class P — per-tier replicated kernel scratch buffers.
@@ -46402,6 +46402,28 @@ static float sample_rng_f32(uint64_t *state) {
     return (float)((x >> 40) & 0xffffffu) / 16777216.0f;
 }
 
+/* The RNG includes zero. A strict comparison and a positive target guard
+ * prevent accepting a zero-mass token, including after float underflow.
+ * Accept probability-one proposals without a draw, as in the point path. */
+static bool sample_speculative_accept(float target_p, float draft_p,
+                                      uint64_t *rng) {
+    if (!rng || !(draft_p > 0.0f) || !isfinite(draft_p)) return false;
+    if (target_p >= draft_p) return true;
+    if (!(target_p > 0.0f) || !isfinite(target_p)) return false;
+    /* The 24-bit draw times a float is exact in double, even for subnormals.
+     * Retain that precision when fast-math reassociates the RNG scaling. */
+    volatile double draw = (double)sample_rng_f32(rng) * (double)draft_p;
+    return draw < (double)target_p;
+}
+
+static float sample_scaled_logit(float logit, float max_logit, float temperature) {
+    /* Retain the centered double value before scaling: float differences or
+     * tiny temperatures' reciprocals can overflow for finite inputs. */
+    volatile double shifted = (double)logit - (double)max_logit;
+    const double scaled = shifted / (double)temperature;
+    return scaled < -(double)FLT_MAX ? -INFINITY : (float)scaled;
+}
+
 typedef struct {
     int id;
     float logit;
@@ -46452,7 +46474,7 @@ static void sample_heap_sift_down(sample_candidate *heap, uint32_t n, uint32_t i
     }
 }
 
-/* Materialize the exact distribution represented by the public sampling
+/* Materialize the probabilities represented by the public sampling
  * knobs. Speculative decoding needs probabilities, rather than only a sampled
  * token, for the p/q acceptance test and the corrected rejection sample. */
 static bool sample_build_probabilities(
@@ -46493,23 +46515,43 @@ static bool sample_build_probabilities(
         return true;
     }
 
+    if (top_k == 0 && top_p >= 1.0f) {
+        /* No nucleus truncation: a rounded prefix sum must not discard a
+         * positive tail. Reuse the output vector instead of sorting it. */
+        double sum = 0.0;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!isfinite(v)) continue;
+            const float raw = expf(sample_scaled_logit(v, max_logit, temperature));
+            if (raw < min_p) continue;
+            probs[i] = raw;
+            sum += (double)raw;
+        }
+        if (sum <= 0.0 || !isfinite(sum)) {
+            memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
+            probs[sample_argmax(logits, n_vocab)] = 1.0f;
+        } else {
+            const double inv_sum = 1.0 / sum;
+            for (uint32_t i = 0; i < n_vocab; i++) {
+                probs[i] = (float)((double)probs[i] * inv_sum);
+            }
+        }
+        return true;
+    }
+
     float full_sum = 0.0f;
-    float heap_sum = 0.0f;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
-        const float raw = expf((v - max_logit) / temperature);
+        const float raw = expf(sample_scaled_logit(v, max_logit, temperature));
         full_sum += raw;
         sample_candidate cand = {.id = (int)i, .logit = v, .prob = raw};
         if (heap_n < heap_cap) {
             heap[heap_n] = cand;
-            heap_sum += raw;
             sample_heap_sift_up(heap, heap_n);
             heap_n++;
         } else if (sample_candidate_gt(cand, heap[0])) {
-            heap_sum -= heap[0].prob;
             heap[0] = cand;
-            heap_sum += raw;
             sample_heap_sift_down(heap, heap_n, 0);
         }
     }
@@ -46519,7 +46561,14 @@ static bool sample_build_probabilities(
     }
 
     qsort(heap, heap_n, sizeof(heap[0]), sample_candidate_cmp_desc);
-    float base_sum = top_k > 0 ? heap_sum : full_sum;
+    float base_sum = full_sum;
+    if (top_k > 0) {
+        /* Normalize in rank order, as the public top-k sampler does. Sequence
+         * additions even under fast-math: heap updates/reassociation can drift. */
+        volatile float selected_sum = 0.0f;
+        for (uint32_t i = 0; i < heap_n; i++) selected_sum += heap[i].prob;
+        base_sum = selected_sum;
+    }
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     bool stopped_by_min_p = false;
@@ -46532,7 +46581,7 @@ static bool sample_build_probabilities(
         }
         filtered_sum += heap[i].prob;
         filtered++;
-        if (filtered_sum / base_sum >= top_p) {
+        if (top_p < 1.0f && filtered_sum / base_sum >= top_p) {
             reached_top_p = true;
             break;
         }
@@ -46556,7 +46605,7 @@ static bool sample_build_probabilities(
             cand[cand_n++] = (sample_candidate){
                 .id = (int)i,
                 .logit = v,
-                .prob = expf((v - max_logit) / temperature),
+                .prob = expf(sample_scaled_logit(v, max_logit, temperature)),
             };
         }
         qsort(cand, cand_n, sizeof(cand[0]), sample_candidate_cmp_desc);
@@ -46568,13 +46617,20 @@ static bool sample_build_probabilities(
             if (i > 0 && cand[i].prob < full_min_raw) break;
             filtered_sum += cand[i].prob;
             filtered++;
-            if (filtered_sum / base_sum >= top_p) break;
+            if (top_p < 1.0f && filtered_sum / base_sum >= top_p) break;
         }
         owned = true;
     }
 
     if (filtered == 0 || filtered_sum <= 0.0f || !isfinite(filtered_sum)) {
         probs[cand[0].id] = 1.0f;
+    } else if (top_p >= 1.0f) {
+        double sum = 0.0;
+        for (uint32_t i = 0; i < filtered; i++) sum += (double)cand[i].prob;
+        const double inv_sum = 1.0 / sum;
+        for (uint32_t i = 0; i < filtered; i++) {
+            probs[cand[i].id] = (float)((double)cand[i].prob * inv_sum);
+        }
     } else {
         const float inv_sum = 1.0f / filtered_sum;
         for (uint32_t i = 0; i < filtered; i++) {
@@ -46588,31 +46644,35 @@ static bool sample_build_probabilities(
 static int sample_probabilities(const float *probs, uint32_t n_vocab,
                                 uint64_t *rng) {
     if (!probs || !rng || n_vocab == 0) return -1;
-    float sum = 0.0f;
+    /* Residual masses can be subnormal: keep their sum and CDF in double. */
+    double sum = 0.0;
+    int last_positive = -1;
     int best = 0;
     float best_p = probs[0];
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float p = probs[i];
-        if (p > 0.0f && isfinite(p)) sum += p;
+        if (p > 0.0f && isfinite(p)) {
+            sum += (double)p;
+            last_positive = (int)i;
+        }
         if (p > best_p) {
             best_p = p;
             best = (int)i;
         }
     }
-    if (sum <= 0.0f || !isfinite(sum)) return best;
-    float r = sample_rng_f32(rng) * sum;
+    if (sum <= 0.0 || !isfinite(sum)) return best;
+    double r = (double)sample_rng_f32(rng) * sum;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float p = probs[i];
         if (p <= 0.0f || !isfinite(p)) continue;
-        r -= p;
-        if (r <= 0.0f) return (int)i;
+        r -= (double)p;
+        if (r < 0.0) return (int)i;
     }
-    return best;
+    return last_positive;
 }
 
-/* Replace target_probs with normalized max(0, p-q) and sample it. This is the
- * correction that keeps speculative decoding distributed exactly as p after
- * a rejected draft token. */
+/* Replace target_probs with max(0, p-q); sample_probabilities normalizes it
+ * implicitly. In exact arithmetic this is the speculative rejection correction. */
 #if defined(DS4_TEST_HOOKS) || defined(DS4_HAS_DEEPSEEK41_GPU)
 static int sample_residual_probabilities(float *target_probs,
                                          const float *draft_probs,
@@ -46621,7 +46681,7 @@ static int sample_residual_probabilities(float *target_probs,
     if (!target_probs || !draft_probs || !rng || n_vocab == 0) return -1;
     int target_best = 0;
     float target_best_p = target_probs[0];
-    float sum = 0.0f;
+    bool have_residual = false;
     for (uint32_t i = 0; i < n_vocab; i++) {
         if (target_probs[i] > target_best_p) {
             target_best_p = target_probs[i];
@@ -46629,10 +46689,10 @@ static int sample_residual_probabilities(float *target_probs,
         }
         float residual = target_probs[i] - draft_probs[i];
         if (!(residual > 0.0f) || !isfinite(residual)) residual = 0.0f;
+        else have_residual = true;
         target_probs[i] = residual;
-        sum += residual;
     }
-    if (sum <= 0.0f || !isfinite(sum)) return target_best;
+    if (!have_residual) return target_best;
     return sample_probabilities(target_probs, n_vocab, rng);
 }
 #endif
@@ -46662,7 +46722,7 @@ static bool sample_fast_top_p(
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
-        const float p = expf((v - max_logit) / temperature);
+        const float p = expf(sample_scaled_logit(v, max_logit, temperature));
         sum += p;
         sample_candidate cand = {.id = (int)i, .logit = v, .prob = p};
         if (n < cap) {
@@ -46687,20 +46747,18 @@ static bool sample_fast_top_p(
     }
 
     qsort(heap, n, sizeof(heap[0]), sample_candidate_cmp_desc);
-    const float min_prob = (heap[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
     const float min_prob_raw = heap[0].prob * (min_p > 0.0f ? min_p : 0.0f);
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     bool stopped_by_min_p = false;
     for (uint32_t i = 0; i < n; i++) {
-        const float p = heap[i].prob / sum;
-        if (i > 0 && p < min_prob) {
+        if (i > 0 && heap[i].prob < min_prob_raw) {
             stopped_by_min_p = true;
             break;
         }
         filtered_sum += heap[i].prob;
         filtered++;
-        if (filtered_sum / sum >= top_p) break;
+        if (top_p < 1.0f && filtered_sum / sum >= top_p) break;
     }
     if (n < finite &&
         stopped_by_min_p &&
@@ -46790,7 +46848,7 @@ static int sample_full_vocab(
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
             if (!isfinite(v)) continue;
-            const float scaled = (v - max_logit) / temperature;
+            const float scaled = sample_scaled_logit(v, max_logit, temperature);
             if (have_reject_scaled && scaled <= reject_scaled) continue;
             const float p = expf(scaled);
             if (p < min_rel) continue;
@@ -46798,14 +46856,7 @@ static int sample_full_vocab(
             sum += p;
         }
         if (sum <= 0.0f || !isfinite(sum)) return best;
-        float r = sample_rng_f32(rng) * sum;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float p = prob_scratch[i];
-            if (p < 0.0f) continue;
-            r -= p;
-            if (r <= 0.0f) return (int)i;
-        }
-        return best;
+        return sample_probabilities(prob_scratch, n_vocab, rng);
     }
 
     uint32_t n = 0;
@@ -46821,16 +46872,15 @@ static int sample_full_vocab(
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
             if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
+            const float p = expf(sample_scaled_logit(v, max_logit, temperature));
             prob_scratch[i] = p;
             sum += p;
         }
         if (sum <= 0.0f || !isfinite(sum)) return best;
 
-        const float min_prob = (1.0f / sum) * min_p;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float p = prob_scratch[i];
-            if (p < 0.0f || p / sum < min_prob) continue;
+            if (p < 0.0f || p < min_p) continue;
             n++;
         }
         if (n == 0) return best;
@@ -46838,7 +46888,7 @@ static int sample_full_vocab(
         uint32_t out = 0;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float p = prob_scratch[i];
-            if (p < 0.0f || p / sum < min_prob) continue;
+            if (p < 0.0f || p < min_p) continue;
             cand[out++] = (sample_candidate){
                 .id = (int)i, .logit = logits[i], .prob = p
             };
@@ -46848,7 +46898,7 @@ static int sample_full_vocab(
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             if (!isfinite(v)) continue;
-            const float p = expf((v - max_logit) / temperature);
+            const float p = expf(sample_scaled_logit(v, max_logit, temperature));
             cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
             sum += p;
         }
@@ -46859,15 +46909,14 @@ static int sample_full_vocab(
     }
 
     qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
-    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
+    const float min_prob_raw = cand[0].prob * (min_p > 0.0f ? min_p : 0.0f);
     float filtered_sum = 0.0f;
     uint32_t filtered = 0;
     for (uint32_t i = 0; i < n; i++) {
-        const float p = cand[i].prob / sum;
-        if (i > 0 && p < min_prob) break;
+        if (i > 0 && cand[i].prob < min_prob_raw) break;
         filtered_sum += cand[i].prob;
         filtered++;
-        if (filtered_sum / sum >= top_p) break;
+        if (top_p < 1.0f && filtered_sum / sum >= top_p) break;
     }
     if (filtered == 0) {
         free(cand);
@@ -46933,24 +46982,32 @@ static int sample_top_p_min_p(
 
     float probs[1024];
     const float max_logit = vals[0];
-    float sum = 0.0f;
+    /* Match materialization's ordered reduction even under fast-math. */
+    volatile float selected_sum = 0.0f;
     for (int i = 0; i < n; i++) {
-        probs[i] = expf((vals[i] - max_logit) / temperature);
-        sum += probs[i];
+        probs[i] = expf(sample_scaled_logit(vals[i], max_logit, temperature));
+        selected_sum += probs[i];
     }
+    const float sum = selected_sum;
     if (sum <= 0.0f || !isfinite(sum)) return ids[0];
 
-    const float min_prob = (probs[0] / sum) * min_p;
+    /* The common normalizer cancels. Dividing first can round a weight below
+     * the min-p boundary onto the boundary, unlike sample_build_probabilities. */
+    const float min_prob_raw = probs[0] * min_p;
     float filtered_sum = 0.0f;
     int filtered = 0;
     for (int i = 0; i < n; i++) {
-        float p = probs[i] / sum;
-        if (i > 0 && p < min_prob) break;
+        if (i > 0 && probs[i] < min_prob_raw) break;
         filtered_sum += probs[i];
         filtered++;
-        if (filtered_sum / sum >= top_p) break;
+        if (top_p < 1.0f && filtered_sum / sum >= top_p) break;
     }
     if (filtered <= 0) return ids[0];
+
+    if (top_p >= 1.0f) {
+        const int index = sample_probabilities(probs, (uint32_t)filtered, rng);
+        return index >= 0 ? ids[index] : ids[0];
+    }
 
     float r = sample_rng_f32(rng) * filtered_sum;
     for (int i = 0; i < filtered; i++) {
@@ -46961,6 +47018,11 @@ static int sample_top_p_min_p(
 }
 
 #ifdef DS4_TEST_HOOKS
+int ds4_test_speculative_accept(float target_p, float draft_p,
+                                uint64_t *rng) {
+    return sample_speculative_accept(target_p, draft_p, rng) ? 1 : 0;
+}
+
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
@@ -47001,7 +47063,7 @@ int ds4_test_speculative_sample(const float *target_logits,
     if (proposal < 0) return -1;
     const float q = draft_probs[proposal];
     const float p = target_probs[proposal];
-    if (q <= 0.0f || sample_rng_f32(rng) * q <= p) return proposal;
+    if (sample_speculative_accept(p, q, rng)) return proposal;
     return sample_residual_probabilities(target_probs, draft_probs,
                                          n_vocab, rng);
 }
@@ -47022,7 +47084,7 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
                                     top_k, top_p, min_p, target_probs)) {
         return -1;
     }
-    if (sample_rng_f32(rng) <= target_probs[draft_token]) {
+    if (sample_speculative_accept(target_probs[draft_token], 1.0f, rng)) {
         return draft_token;
     }
     target_probs[draft_token] = 0.0f;
@@ -62361,6 +62423,10 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend,
  *                                                          sizeof(float)
  *                                                        : 0)
  *
+ *   frontier_bytes_per_layer = 2 * coff^2 * ratio * head_dim * sizeof(float)
+ *                              + the same pair at indexer_head_dim for ratio 4;
+ *                              coff is 2 for ratio 4 and 1 otherwise.
+ *
  * Per-tier scratch buffers (indexer_scores_by_tier, comp_mask_by_tier,
  * attn_comp_stage_by_tier, chunked-prefill batch_*_by_tier, head extras)
  * are NOT included here. They are reserved separately by
@@ -62371,7 +62437,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend,
  * Invariant (by construction): sum over il of
  * engine_per_layer_kv_bytes_planner(il, ctx, prefill_chunk) ==
  *   DS4_N_LAYER * raw_cap * DS4_N_HEAD_DIM * sizeof(float)
- *   + sum_over_ratio_layers(compressed_per_layer)
+ *   + sum_over_ratio_layers(compressed_per_layer + frontier_bytes_per_layer)
  */
 /* Planner equivalents of metal_graph_prefill_cap_for_prompt and
  * metal_graph_raw_cap_for_context. The graph variants live inside
@@ -62513,27 +62579,24 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
     return bytes;
 }
 
-/* Per-used-tier Class-P graph overhead estimate. Mirrors the
- * `*_by_tier[t]` allocations in
- * metal_graph_alloc_raw_cap (ds4.c:10664-10686 + 10760-10800 + 10806-10816
- * for head extras + 10844 for prefill_tokens + 10852-10892 for batch
- * chunked-prefill scratch).
+/* Per-used-tier Class-P overhead for one ordinary graph session. Mirrors
+ * decode and prefill allocations in metal_graph_alloc_raw_cap, including
+ * lazily materialized FFN outputs. Optional MTP/speculative workspaces are
+ * separate from this ordinary-session estimate.
  *
  * The runtime loop replicates an entire set of Class-P kernel-scratch
  * buffers on EVERY used tier. The packer's budget math (entry_bytes) only
  * accounts for tensor weights + per-layer KV — it never reserved this
  * per-tier scratch, so a layout that fit by entry_bytes could still
- * late-OOM at session_create. This helper returns the exact byte total,
+ * late-OOM at session_create. This helper returns a conservative byte total,
  * which is then pre-subtracted from EVERY device's vram_bytes inside
  * engine_classify_multi_tier (conservative: even tiers that end up unused
- * still reserve the overhead, so the packer cannot accept a layout that
- * would later OOM).
+ * still reserve the overhead before the packer assigns entries).
  *
- * Head-tier extras (output_pre/weights/embd/norm/logits at ds4.c:10806-10816)
- * and prefill_tokens (ds4.c:10844 — emb_tier only) are charged to ALL tiers
- * conservatively: only the head_tier / emb_tier actually pays at runtime, but
+ * Head-tier extras, prefill_tokens, batch_q_half and the router seed cache
+ * are charged to ALL tiers conservatively: only their owning tier pays at runtime, but
  * since the pre-subtract is a single scalar applied to every device, charging
- * to all is the simplest correct posture. The over-charge is a few MB total.
+ * to all avoids depending on a placement that has not been computed yet.
  *
  * Uses g_ds4_shape compile-time constants (DS4_N_*) and ctx-derived caps
  * from engine_planner_prefill_cap. The runtime computes some dims from
@@ -84787,10 +84850,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
 
 static bool speculative_point_accept(float target_p, float draft_p,
                                      uint64_t *rng) {
-    if (!rng || !(draft_p > 0.0f) || !isfinite(draft_p)) return false;
-    if (target_p >= draft_p) return true;
-    if (!(target_p > 0.0f) || !isfinite(target_p)) return false;
-    return sample_rng_f32(rng) * draft_p <= target_p;
+    return sample_speculative_accept(target_p, draft_p, rng);
 }
 
 static int speculative_point_replacement(
@@ -88423,7 +88483,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             if (!sample_build_probabilities(p_logits, DS4_N_VOCAB,
                 temperature, top_k, top_p, min_p, s->sample_probs)) goto fail;
             const int token = tokens[keep];
-            if (sample_rng_f32(rng) * q[token] > s->sample_probs[token]) {
+            if (!sample_speculative_accept(s->sample_probs[token], q[token], rng)) {
                 correction = sample_residual_probabilities(s->sample_probs, q, DS4_N_VOCAB, rng);
                 break;
             }

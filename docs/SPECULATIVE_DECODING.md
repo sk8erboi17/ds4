@@ -150,6 +150,30 @@ perfect, disengaging after repeated second-draft rejections.
 
 ## Sampling and reproducibility
 
+With `top_p=1`, the nucleus filter keeps every candidate allowed by top-k and
+min-p. A rounded prefix mass reaching the total is not a reason to truncate
+positive tails. Full-vocabulary probability materialization uses the output
+vector directly, and endpoint normalization uses double. Ordinary endpoint
+sampling uses the same double CDF helper as probability-vector sampling. Final
+float probabilities can still underflow, and discrete draws and ordering can
+still make ordinary and speculative seeded sequences differ.
+
+Sampling centers and scales finite logits in double before passing the argument
+to `expf`. This preserves ties at tiny positive temperatures and avoids overflow
+when opposite finite float logits are combined with a large temperature. Values
+below the float argument range become negative infinity, whose exponential is
+zero. Correcting these numeric extremes can change seeded tokens and RNG draws.
+
+Min-p compares unnormalized token weights against `min_p` times the largest
+weight. Ordinary and speculative sampling use this same cutoff, including
+equality. Dividing both sides by the softmax sum first can round a weight
+below the cutoff onto it; correcting that boundary can change seeded tokens.
+
+For positive top-k, the probability materializer recomputes the selected mass
+in rank order. Both paths sequence these additions under fast-math. Carrying a
+running mass through heap replacements, or using another reduction order, can
+change nucleus membership at a rounded top-p boundary and change seeded tokens.
+
 At temperature zero, accepted drafts must match the target's greedy
 continuation. At non-zero temperature, the default mode is opportunistic:
 ordinary tokens use the requested sampling settings, but matching greedy
@@ -160,6 +184,19 @@ Use `--mtp-exact-sampling` to preserve the ordinary target sampling
 distribution. Greedy proposals are accepted with their target probability;
 sampled proposals use the target-to-draft probability ratio. Rejections sample
 from the remaining target probability mass.
+
+The acceptance check rejects zero target probability and uses a strict
+comparison because the RNG can return zero. Proposals whose target probability
+is at least their draft probability are accepted without an RNG draw. As with
+ordinary sampling, finite-precision probabilities and the discrete RNG still
+apply; seeded token sequences can change when the acceptance rule is corrected.
+
+Fractional acceptance compares the draw times the draft mass in double, so
+subnormal float probabilities do not underflow during the comparison. Sampling
+a probability vector also accumulates and scans its mass in double, with
+half-open CDF intervals. Rejection residuals retain their raw positive masses
+and are normalized implicitly by that sampler. These rules can change seeded
+tokens at CDF boundaries and for extremely small residuals.
 
 When a verified block crosses a tool sampling-mode boundary (for example
 entering tool-call syntax during server decoding), the server rewinds to the
