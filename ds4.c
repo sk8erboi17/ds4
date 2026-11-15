@@ -13042,6 +13042,22 @@ static void topk_desc(const float *score, int n, int k, int *idx) {
     }
 }
 
+static void topk_allow_scores(bool *allowed, const float *scores,
+                              uint32_t n, uint32_t k) {
+    for (uint32_t rank = 0; rank < k; rank++) {
+        uint32_t best = UINT32_MAX;
+        float best_score = 0.0f;
+        for (uint32_t i = 0; i < n; i++) {
+            if (!allowed[i] && (best == UINT32_MAX || scores[i] > best_score)) {
+                best = i;
+                best_score = scores[i];
+            }
+        }
+        if (best == UINT32_MAX) break;
+        allowed[best] = true;
+    }
+}
+
 /* Later layers choose the six experts by biased top-k, but weight them using
  * the unbiased router probabilities. */
 static void layer_topk_selected_experts_from_probs(
@@ -15252,17 +15268,7 @@ static bool *indexer_allowed_decode_one(
         scores[c] = s;
     }
 
-    for (uint32_t k = 0; k < top_k; k++) {
-        uint32_t best = 0;
-        float best_score = DS4_NEG_INF;
-        for (uint32_t c = 0; c < n_comp; c++) {
-            if (!allowed[c] && scores[c] > best_score) {
-                best = c;
-                best_score = scores[c];
-            }
-        }
-        allowed[best] = true;
-    }
+    topk_allow_scores(allowed, scores, n_comp, top_k);
 
     free(scores);
     free(weights);
@@ -15318,17 +15324,7 @@ static bool *indexer_allowed_decode_one_decode_scratch(
         scores[c] = s;
     }
 
-    for (uint32_t k = 0; k < top_k; k++) {
-        uint32_t best = 0;
-        float best_score = DS4_NEG_INF;
-        for (uint32_t c = 0; c < n_comp; c++) {
-            if (!allowed[c] && scores[c] > best_score) {
-                best = c;
-                best_score = scores[c];
-            }
-        }
-        allowed[best] = true;
-    }
+    topk_allow_scores(allowed, scores, n_comp, top_k);
 
     return allowed;
 }
@@ -46328,7 +46324,7 @@ static inline void argmax_f32_unrolled8_range(
 
 static int sample_argmax_unrolled8(const float *logits, uint32_t n_vocab) {
     int best = 0;
-    float best_v = DS4_NEG_INF;
+    float best_v = -INFINITY;
     argmax_f32_unrolled8_range(logits, 0, n_vocab, &best, &best_v);
     return best;
 }
@@ -46360,7 +46356,7 @@ static int sample_argmax(const float *logits, uint32_t n_vocab) {
         return sample_argmax_unrolled8(logits, n_vocab);
     }
     int best = 0;
-    float best_v = DS4_NEG_INF;
+    float best_v = -INFINITY;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (v > best_v) {
@@ -46375,7 +46371,7 @@ static DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
                         int *top0, float *logit0,
                         int *top1, float *logit1) {
     int b0 = -1, b1 = -1;
-    float v0 = DS4_NEG_INF, v1 = DS4_NEG_INF;
+    float v0 = -INFINITY, v1 = -INFINITY;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (v > v0) {
@@ -46486,7 +46482,7 @@ static bool sample_build_probabilities(
         (uint32_t)SAMPLE_PROB_FAST_CAP;
     uint32_t finite = 0;
     uint32_t heap_n = 0;
-    float max_logit = DS4_NEG_INF;
+    float max_logit = -INFINITY;
     for (uint32_t i = 0; i < n_vocab; i++) {
         if (!isfinite(logits[i])) continue;
         finite++;
@@ -46737,7 +46733,7 @@ static int sample_full_vocab(
         float        min_p,
         uint64_t    *rng,
         float       *prob_scratch) {
-    float max_logit = DS4_NEG_INF;
+    float max_logit = -INFINITY;
     int best = 0;
     uint32_t finite = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
@@ -80182,6 +80178,12 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
                               top_p, min_p, rng, s->sample_probs);
 }
 
+static float logits_logprob_shifted(float logit, float max_logit, double log_norm) {
+    /* Preserve the shift before log_norm even with fast-math reassociation. */
+    volatile double shifted = (double)logit - (double)max_logit;
+    return (float)(shifted - log_norm);
+}
+
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
@@ -80191,7 +80193,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
         out[i].logprob = DS4_NEG_INF;
     }
 
-    float max_logit = DS4_NEG_INF;
+    float max_logit = -INFINITY;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
         const float v = s->logits[i];
         if (!isfinite(v)) continue;
@@ -80212,9 +80214,10 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
-    const double logsum = (double)max_logit + log(sum);
+    const double log_norm = log(sum);
     for (int i = 0; i < k && out[i].id >= 0; i++) {
-        out[i].logprob = isfinite(out[i].logit) ? (float)((double)out[i].logit - logsum) : DS4_NEG_INF;
+        out[i].logprob = isfinite(out[i].logit) ?
+            logits_logprob_shifted(out[i].logit, max_logit, log_norm) : DS4_NEG_INF;
     }
     return k;
 }
@@ -80222,7 +80225,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
 
-    float max_logit = DS4_NEG_INF;
+    float max_logit = -INFINITY;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
         const float v = s->logits[i];
         if (isfinite(v) && v > max_logit) max_logit = v;
@@ -80234,10 +80237,11 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
-    const double logsum = (double)max_logit + log(sum);
+    const double log_norm = log(sum);
     out->id = token;
     out->logit = s->logits[token];
-    out->logprob = isfinite(out->logit) ? (float)((double)out->logit - logsum) : DS4_NEG_INF;
+    out->logprob = isfinite(out->logit) ?
+        logits_logprob_shifted(out->logit, max_logit, log_norm) : DS4_NEG_INF;
     return 1;
 }
 
