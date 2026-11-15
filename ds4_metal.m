@@ -46466,6 +46466,11 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
     return 1;
 }
 
+/* HC kernels use a uint gid; even the last padded thread index must fit. */
+static bool ds4_gpu_hc_grid_fits_u32(uint64_t n_elem) {
+    return n_elem > 0 && n_elem <= (uint64_t)UINT32_MAX + 1u;
+}
+
 static int ds4_gpu_hc_weighted_sum_strided(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,
@@ -46509,12 +46514,15 @@ static int ds4_gpu_hc_weighted_sum_strided(
         }
 
         const uint64_t x_bytes = n_tokens64 * x_row_values * sizeof(float);
-        const uint64_t w_last = weight_offset +
-                                (n_tokens64 - 1u) * weight_row_stride +
-                                (uint64_t)n_hc * sizeof(float);
+        /* Bound the strided span without forming an overflowing end offset. */
+        const uint64_t weight_bytes = (uint64_t)n_hc * sizeof(float);
+        const uint64_t weights_bytes = ds4_gpu_tensor_bytes(weights);
         if (!xbuf || !wbuf || !outbuf ||
             ds4_gpu_tensor_bytes(residual_hc) < x_bytes ||
-            ds4_gpu_tensor_bytes(weights) < w_last) {
+            weight_offset > weights_bytes ||
+            weight_bytes > weights_bytes - weight_offset ||
+            n_tokens64 - 1u >
+                (weights_bytes - weight_offset - weight_bytes) / weight_row_stride) {
             fprintf(stderr, "ds4: Metal HC weighted sum received undersized activation buffers\n");
             return 0;
         }
@@ -46533,6 +46541,7 @@ static int ds4_gpu_hc_weighted_sum_strided(
             .round_bf16 = (uint64_t)(round_bf16 != 0),
         };
         const uint64_t n_elem = (uint64_t)n_embd * n_tokens64;
+        if (!ds4_gpu_hc_grid_fits_u32(n_elem)) return 0;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
         const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
         int owned = 0;
@@ -47767,6 +47776,7 @@ int ds4_gpu_hc_expand_tensor(
             n_elem = (uint64_t)n_embd * n_tokens64;
         }
         if (!expand_pipeline) return 0;
+        if (!ds4_gpu_hc_grid_fits_u32(n_elem)) return 0;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
         const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
         int owned = 0;
@@ -47884,6 +47894,7 @@ int ds4_gpu_hc_expand_add_tensor(
             n_elem = (uint64_t)n_embd * n_tokens64;
         }
         if (!expand_pipeline) return 0;
+        if (!ds4_gpu_hc_grid_fits_u32(n_elem)) return 0;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
         const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
         int owned = 0;
@@ -48010,6 +48021,7 @@ static int ds4_gpu_hc_expand_split_impl(
             fprintf(stderr, "ds4: Metal HC expand split pipeline is unavailable\n");
             return 0;
         }
+        if (!ds4_gpu_hc_grid_fits_u32(n_elem)) return 0;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
         const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
         int owned = 0;
@@ -48168,6 +48180,7 @@ int ds4_gpu_hc_expand_add_split_tensor(
             n_elem = (uint64_t)n_embd * n_tokens64;
         }
         if (!expand_pipeline) return 0;
+        if (!ds4_gpu_hc_grid_fits_u32(n_elem)) return 0;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
         const NSUInteger n_tg = ((NSUInteger)n_elem + nth - 1u) / nth;
         int owned = 0;
