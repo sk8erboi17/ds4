@@ -30200,6 +30200,10 @@ static bool metal_graph_encode_token_raw_swa(
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
 
+    /* A fresh token embedding supersedes any deferred final HC from the
+     * previous token, including workers that did not need an output head. */
+    if (ok) g->hc_expand_pending = false;
+
     /*
      * Start executing the prefix of the decode graph while the CPU is still
      * encoding the rest. The split point is layer-based because this executor is
@@ -30329,7 +30333,7 @@ static bool metal_graph_encode_token_raw_swa(
 
     if (ok && need_logits) {
         if (ok) ok = metal_graph_flush_hc_expand(g);
-        ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     }
 #if defined(__APPLE__)
     (void)ds4_gpu_set_decode_pipeline_fast_lookup(
