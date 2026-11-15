@@ -32781,7 +32781,7 @@ static NSUInteger ds4_gpu_bin_threads(uint32_t width, id<MTLComputePipelineState
     NSUInteger nth_max = pipeline.maxTotalThreadsPerThreadgroup;
     if (nth_max > 256u) nth_max = 256u;
     NSUInteger nth = 1u;
-    while (2u * nth < (NSUInteger)width && nth < nth_max) nth *= 2u;
+    while (2u * nth < (NSUInteger)width && 2u * nth <= nth_max) nth *= 2u;
     return nth ? nth : 1u;
 }
 
