@@ -30390,74 +30390,99 @@ static bool metal_graph_refresh_ratio4_compressor_state(
         return false;
     }
 
-    /*
-     * The recurrent ratio-4 state is intentionally rebuilt from the last
-     * four tokens using the small-batch projection kernel. The full-chunk
-     * projection is already available, but it uses the matrix-matrix path;
-     * mixing those two accumulation orders changes a few FP8 rounding
-     * decisions in later chunks.
-     */
-    ds4_gpu_tensor *tail_hc = ds4_gpu_tensor_view(
+    /* Keep the last complete window and its partial successor separate.
+     * The last four tokens alone straddle both windows on an unaligned tail.
+     * Keep four-token projections in both passes: a one-token projection takes
+     * a different kernel, and changing accumulation order can change later
+     * FP8 rounding. The partial append borrows only the final rem output rows. */
+    const uint32_t rem = (pos0 + n_tokens) % 4u;
+    if (n_tokens < 4u + rem) return true;
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        const uint32_t count = pass == 0 ? 4u : rem;
+        if (count == 0) break;
+        const uint32_t start = n_tokens - 4u - (pass == 0 ? rem : 0u);
+        ds4_gpu_tensor *tail_hc = ds4_gpu_tensor_view(
             metal_graph_batch_attn_norm(g),
-            (uint64_t)(n_tokens - 4u) * DS4_N_EMBD * sizeof(float),
+            (uint64_t)start * DS4_N_EMBD * sizeof(float),
             4ull * DS4_N_EMBD * sizeof(float));
-    bool ok = tail_hc != NULL;
-    if (!ok) {
-        fprintf(stderr, "ds4: ratio-4 compressor tail view creation failed\n");
-    }
-    if (ok) {
-#if defined(__APPLE__)
-        ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
-                                        model->map,
-                                        model->size,
-                                        kv_weight->abs_offset,
-                                        DS4_N_EMBD,
-                                        width,
-                                        tail_hc,
-                                        4) != 0;
+        bool ok = tail_hc != NULL;
+        if (!ok) {
+            fprintf(stderr, "ds4: ratio-4 compressor tail view creation failed\n");
+        }
         if (ok) {
-            ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
+#if defined(__APPLE__)
+            ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
                                             model->map,
                                             model->size,
-                                            score_weight->abs_offset,
+                                            kv_weight->abs_offset,
                                             DS4_N_EMBD,
                                             width,
                                             tail_hc,
                                             4) != 0;
-        }
+            if (ok) {
+                ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
+                                                model->map,
+                                                model->size,
+                                                score_weight->abs_offset,
+                                                DS4_N_EMBD,
+                                                width,
+                                                tail_hc,
+                                                4) != 0;
+            }
 #else
-        ok = ds4_gpu_matmul_f16_pair_tensor(metal_graph_batch_comp_kv(g),
-                                             metal_graph_batch_comp_sc(g),
-                                             model->map,
-                                             model->size,
-                                             kv_weight->abs_offset,
-                                             score_weight->abs_offset,
-                                             DS4_N_EMBD,
-                                             width,
-                                             tail_hc,
-                                             4) != 0;
+            ok = ds4_gpu_matmul_f16_pair_tensor(metal_graph_batch_comp_kv(g),
+                                                 metal_graph_batch_comp_sc(g),
+                                                 model->map,
+                                                 model->size,
+                                                 kv_weight->abs_offset,
+                                                 score_weight->abs_offset,
+                                                 DS4_N_EMBD,
+                                                 width,
+                                                 tail_hc,
+                                                 4) != 0;
 #endif
-        if (!ok) {
-            fprintf(stderr, "ds4: ratio-4 compressor tail projection failed\n");
+            if (!ok) {
+                fprintf(stderr, "ds4: ratio-4 compressor tail projection failed\n");
+            }
         }
-    }
-    if (ok) {
-        ok = ds4_gpu_compressor_prefill_state_ratio4_tensor(state_kv,
-                                                              state_score,
-                                                              metal_graph_batch_comp_kv(g),
-                                                              metal_graph_batch_comp_sc(g),
-                                                              model->map,
-                                                              model->size,
-                                                              ape->abs_offset,
-                                                              ape->type,
-                                                              head_dim,
-                                                              pos0 + n_tokens - 4u) != 0;
-        if (!ok) {
-            fprintf(stderr, "ds4: ratio-4 compressor state refresh failed\n");
+        if (ok && pass == 0) {
+            ok = ds4_gpu_compressor_prefill_state_ratio4_tensor(state_kv,
+                                                                  state_score,
+                                                                  metal_graph_batch_comp_kv(g),
+                                                                  metal_graph_batch_comp_sc(g),
+                                                                  model->map,
+                                                                  model->size,
+                                                                  ape->abs_offset,
+                                                                  ape->type,
+                                                                  head_dim,
+                                                                  pos0 + start) != 0;
+            if (!ok) {
+                fprintf(stderr, "ds4: ratio-4 compressor state refresh failed\n");
+            }
+        } else if (ok) {
+            const uint64_t offset = (uint64_t)(4u - count) * width * sizeof(float);
+            const uint64_t bytes = (uint64_t)count * width * sizeof(float);
+            ds4_gpu_tensor *tail_kv = ds4_gpu_tensor_view(
+                    metal_graph_batch_comp_kv(g), offset, bytes);
+            ds4_gpu_tensor *tail_sc = tail_kv ? ds4_gpu_tensor_view(
+                    metal_graph_batch_comp_sc(g), offset, bytes) : NULL;
+            ok = tail_kv && tail_sc;
+            if (ok) {
+                ok = ds4_gpu_compressor_store_batch_tensor(
+                        tail_kv, tail_sc, state_kv, state_score,
+                        model->map, model->size, ape->abs_offset, ape->type,
+                        head_dim, 4u, pos0 + n_tokens - rem, count) != 0;
+            }
+            ds4_gpu_tensor_free(tail_sc);
+            ds4_gpu_tensor_free(tail_kv);
+            if (!ok) {
+                fprintf(stderr, "ds4: ratio-4 partial compressor state refresh failed\n");
+            }
         }
+        ds4_gpu_tensor_free(tail_hc);
+        if (!ok) return false;
     }
-    ds4_gpu_tensor_free(tail_hc);
-    return ok;
+    return true;
 }
 
 /* CPU fallback for seeding batched HC state from token embeddings.  It is still
